@@ -104,7 +104,8 @@ export function createController() {
         console.log(err);
         return res.status(500).json({ error: "File upload failed" });
       }
-      console.log(files);
+      const voice = fields.voice![0];
+      const strength = parseInt(fields.strength![0]);
       const videoFile = files.video;
       if (!videoFile) {
         return res.status(400).json({ error: "No video file uploaded" });
@@ -121,15 +122,17 @@ export function createController() {
           `ffmpeg -i ${videoPath} -q:a 0 -map a ${audioPath}`,
           "EXTRACT"
         );
-
+        const payload = JSON.stringify({
+          audio_path: audioPath,
+          audio_filename: audioFilename,
+          voice_type: voice,
+          strength: strength,
+        });
+        console.log(payload);
         // Send the extracted audio to the Python script for inference
         const response = await fetch("http://127.0.0.1:8000/inference", {
           method: "POST",
-          body: JSON.stringify({
-            audio_path: audioPath,
-            audio_filename: audioFilename,
-            voice_type: "kid",
-          }),
+          body: payload,
           headers: { "Content-Type": "application/json" },
         });
         if (response.status !== 200) {
@@ -154,7 +157,7 @@ export function createController() {
         }
 
         await execPromise(
-          `ffmpeg -y -i "${videoPath}" -i "${output_audio}" -map 0:v -map 1:a -c:v copy -c:a aac -strict experimental "${outputVideoPath}"`,
+          `ffmpeg -y -i "${videoPath}" -i "${output_audio}" -c:v copy -map 0:v:0 -map 1:a:0 "${outputVideoPath}"`,
           "MERGE"
         );
 
@@ -162,6 +165,9 @@ export function createController() {
           message: "Voice conversion successful!",
           video: outputVideoPath,
         });
+        fs.unlink(videoPath, (err) => {});
+        fs.unlink(audioPath, (err) => {});
+        fs.unlink(output_audio, (err) => {});
       } catch (error) {
         console.error("Error processing request:", error);
         res.status(500).json({ error: "Voice processing failed" });
