@@ -1,0 +1,48 @@
+{
+  "name": "vocal-shift-ai",
+  "version": "1.0.0",
+  "description": "Express TypeScript application generated with express-generator-typescript",
+  "scripts": {
+    "start": "node ./dist/bin/www.js",
+    "dev": "nodemon --exec ts-node --files bin/www.ts",
+    "build": "rimraf dist && tsc && npm run copy-files",
+    "copy-files": "copyfiles -u 1 'src/views/**/*' src/public/**/* dist/src/",
+    "lint": "eslint . --ext .ts",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "express",
+    "typescript",
+    "node"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@types/node-fetch": "2",
+    "child_process": "^1.0.2",
+    "compression": "^1.8.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "formidable": "^3.5.2",
+    "helmet": "^8.0.0",
+    "morgan": "^1.10.0",
+    "node-fetch": "2",
+    "typescript": "^5.8.2"
+  },
+  "devDependencies": {
+    "@types/compression": "^1.7.5",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/formidable": "^3",
+    "@types/helmet": "^4.0.0",
+    "@types/morgan": "^1.9.9",
+    "@types/node": "^22.13.5",
+    "copyfiles": "^2.4.1",
+    "debug": "^4.4.0",
+    "nodemon": "^3.1.9",
+    "rimraf": "^6.0.1",
+    "ts-node": "^10.9.2",
+    "tsc-watch": "6.2.1"
+  },
+  "packageManager": "yarn@4.6.0"
+}

@@ -1,0 +1,24 @@
+name: voice_conversion
+channels:
+  - conda-forge
+  - huggingface
+  - pytorch
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - scipy
+  - pandas
+  - flask
+  - ffmpeg
+  - librosa
+  - pysoundfile
+  - huggingface_hub
+  - transformers
+  - datasets
+  - pytorch
+  - torchvision
+  - torchaudio
+  - liblapack
+  - pip:
+      - soundfile

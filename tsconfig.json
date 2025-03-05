@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "lib": ["ES2020", "esnext.asynciterable"],
+    "sourceMap": true,
+    "outDir": "./dist",
+    "rootDir": "./",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "typeRoots": ["./node_modules/@types"]
+  },
+  "include": [
+    "./src/**/*",
+    "./bin/**/*",
+    "./src/views/**/*.ejs",
+    "./src/views/**/*.pug",
+    "./src/views/**/*.handlebars",
+    "./src/public/**/*"
+  ],
+  "exclude": ["node_modules", "./src/migrations/**/*", "dist"]
+}
