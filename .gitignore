@@ -33,3 +33,8 @@ yarn-error.log*
 
 uploads
 .yarn
+
+# Model cache
+model_cache/
+
+FreeVC/

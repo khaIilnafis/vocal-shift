@@ -912,37 +912,6 @@ __metadata:
   languageName: node
   linkType: hard
 
-"express-typescript-app@workspace:.":
-  version: 0.0.0-use.local
-  resolution: "express-typescript-app@workspace:."
-  dependencies:
-    "@types/compression": "npm:^1.7.5"
-    "@types/cors": "npm:^2.8.17"
-    "@types/express": "npm:^5.0.0"
-    "@types/formidable": "npm:^3"
-    "@types/helmet": "npm:^4.0.0"
-    "@types/morgan": "npm:^1.9.9"
-    "@types/node": "npm:^22.13.5"
-    "@types/node-fetch": "npm:2"
-    child_process: "npm:^1.0.2"
-    compression: "npm:^1.8.0"
-    copyfiles: "npm:^2.4.1"
-    cors: "npm:^2.8.5"
-    debug: "npm:^4.4.0"
-    dotenv: "npm:^16.4.7"
-    express: "npm:^4.21.2"
-    formidable: "npm:^3.5.2"
-    helmet: "npm:^8.0.0"
-    morgan: "npm:^1.10.0"
-    node-fetch: "npm:2"
-    nodemon: "npm:^3.1.9"
-    rimraf: "npm:^6.0.1"
-    ts-node: "npm:^10.9.2"
-    tsc-watch: "npm:6.2.1"
-    typescript: "npm:^5.8.2"
-  languageName: unknown
-  linkType: soft
-
 "express@npm:^4.21.2":
   version: 4.21.2
   resolution: "express@npm:4.21.2"
@@ -2610,6 +2579,37 @@ __metadata:
   checksum: 10c0/f15d588d79f3675135ba783c91a4083dcd290a2a5be9fcb6514220a1634e23df116847b1cc51f66bfb0644cf9353b2abb7815ae499bab06e46dd33c1a6bf1f4f
   languageName: node
   linkType: hard
+
+"vocal-shift-ai@workspace:.":
+  version: 0.0.0-use.local
+  resolution: "vocal-shift-ai@workspace:."
+  dependencies:
+    "@types/compression": "npm:^1.7.5"
+    "@types/cors": "npm:^2.8.17"
+    "@types/express": "npm:^5.0.0"
+    "@types/formidable": "npm:^3"
+    "@types/helmet": "npm:^4.0.0"
+    "@types/morgan": "npm:^1.9.9"
+    "@types/node": "npm:^22.13.5"
+    "@types/node-fetch": "npm:2"
+    child_process: "npm:^1.0.2"
+    compression: "npm:^1.8.0"
+    copyfiles: "npm:^2.4.1"
+    cors: "npm:^2.8.5"
+    debug: "npm:^4.4.0"
+    dotenv: "npm:^16.4.7"
+    express: "npm:^4.21.2"
+    formidable: "npm:^3.5.2"
+    helmet: "npm:^8.0.0"
+    morgan: "npm:^1.10.0"
+    node-fetch: "npm:2"
+    nodemon: "npm:^3.1.9"
+    rimraf: "npm:^6.0.1"
+    ts-node: "npm:^10.9.2"
+    tsc-watch: "npm:6.2.1"
+    typescript: "npm:^5.8.2"
+  languageName: unknown
+  linkType: soft
 
 "webidl-conversions@npm:^3.0.0":
   version: 3.0.1

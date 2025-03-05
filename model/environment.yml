@@ -22,3 +22,4 @@ dependencies:
   - liblapack
   - pip:
       - soundfile
+      - speechbrain
