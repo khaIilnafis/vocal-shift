@@ -37,4 +37,5 @@ uploads
 # Model cache
 model_cache/
 
-FreeVC/
+model/FreeVC/** 
+model/DiffHierVC/** 

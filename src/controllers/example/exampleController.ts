@@ -104,31 +104,38 @@ export function createController() {
         console.log(err);
         return res.status(500).json({ error: "File upload failed" });
       }
-      const voice = fields.voice![0];
-      const strength = parseInt(fields.strength![0]);
-      const videoFile = files.video;
-      if (!videoFile) {
+      //   const voice = fields.voice![0];
+      const strength = parseFloat(fields.strength![0]);
+      const srcVideoFile = files.src;
+      const tgtAudioFile = files.tgt;
+      if (!srcVideoFile || !tgtAudioFile) {
         return res.status(400).json({ error: "No video file uploaded" });
       }
 
-      const videoPath = videoFile[0].filepath; // Correct way to access file path in Formidable v3+
+      const srcFilename = srcVideoFile[0].newFilename; // Correct way to access file path in Formidable v3+
+      const tgtFilename = tgtAudioFile[0].newFilename; // Correct way to access file path in Formidable v3+
       const audioFilename = `${Date.now()}_audio.wav`;
       const audioPath = path.join(UPLOAD_FOLDER, audioFilename);
+      const srcPath = srcVideoFile[0].filepath;
+      const srcAudioPath = path.join(UPLOAD_FOLDER, srcFilename);
+
+      const tgtPath = tgtAudioFile[0].filepath;
       const outputVideoPath = `./uploads/${Date.now()}_output.mp4`;
 
       try {
         // Extract audio from video using ffmpeg
         await execPromise(
-          `ffmpeg -i ${videoPath} -q:a 0 -map a ${audioPath}`,
+          `ffmpeg -i ${srcPath} -ar 16000 -ac 1 -c:a pcm_s16le ${audioPath}`,
           "EXTRACT"
         );
         const payload = JSON.stringify({
-          audio_path: audioPath,
-          audio_filename: audioFilename,
-          voice_type: voice,
+          src_path: audioPath,
+          src_filename: srcFilename,
+          tgt_filename: tgtFilename,
+          tgt_path: tgtPath,
           strength: strength,
         });
-        console.log(payload);
+
         // Send the extracted audio to the Python script for inference
         const response = await fetch("http://127.0.0.1:8000/inference", {
           method: "POST",
@@ -141,33 +148,36 @@ export function createController() {
           res.status(400).json(err);
           return;
         }
-        const { output_audio } = (await response.json()) as any;
-        console.log(output_audio);
+        const { output_path, time } = (await response.json()) as any;
+
         // Merge processed audio back into the video
         console.log(
-          `Merging: Video path: ${videoPath}, Audio path: ${output_audio}`
+          `Merging: Video path: ${srcPath}, Audio path: ${output_path}`
         );
 
         // Verify both files exist before merging
-        if (!fs.existsSync(videoPath)) {
-          throw new Error(`Video file does not exist: ${videoPath}`);
+        if (!fs.existsSync(srcPath)) {
+          throw new Error(`Video file does not exist: ${srcPath}`);
         }
-        if (!fs.existsSync(output_audio)) {
-          throw new Error(`Audio file does not exist: ${output_audio}`);
+        if (!fs.existsSync(output_path)) {
+          throw new Error(`Audio file does not exist: ${output_path}`);
         }
 
         await execPromise(
-          `ffmpeg -y -i "${videoPath}" -i "${output_audio}" -c:v copy -map 0:v:0 -map 1:a:0 "${outputVideoPath}"`,
+          `ffmpeg -y -i "${srcPath}" -i "${output_path}" -c:v copy -map 0:v:0 -map 1:a:0 "${outputVideoPath}"`,
           "MERGE"
         );
 
         res.json({
           message: "Voice conversion successful!",
           video: outputVideoPath,
+          time: time,
         });
-        fs.unlink(videoPath, (err) => {});
+        fs.unlink(srcAudioPath, (err) => {});
+        fs.unlink(srcPath, (err) => {});
+        // fs.unlink(output_path, (err) => {});
+        fs.unlink(tgtPath, (err) => {});
         fs.unlink(audioPath, (err) => {});
-        fs.unlink(output_audio, (err) => {});
       } catch (error) {
         console.error("Error processing request:", error);
         res.status(500).json({ error: "Voice processing failed" });

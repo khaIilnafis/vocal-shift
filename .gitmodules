@@ -1,3 +1,6 @@
 [submodule "model/FreeVC"]
 	path = model/FreeVC
 	url = https://github.com/OlaWod/FreeVC.git
+[submodule "model/DiffHierVC"]
+	path = model/DiffHierVC
+	url = https://github.com/hayeong0/Diff-HierVC.git
