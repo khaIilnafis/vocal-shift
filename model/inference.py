@@ -19,6 +19,8 @@ import json
 import tempfile
 from cached_path import cached_path
 import os
+# For time stretching audio
+import pyrubberband as pyrb
 # Enable MPS fallback to CPU for operations not supported by MPS
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
@@ -106,8 +108,8 @@ def infer(
         return
 
     ema_model = F5TTS_ema_model
-    duration = librosa.get_duration(path=ref_audio)
-    print(f"Ref Audio Duration: {duration:.2f} seconds")
+    # duration = librosa.get_duration(path=ref_audio)
+
     final_wave, final_sample_rate, combined_spectrogram = infer_process(
         ref_audio,
         ref_text,
@@ -118,7 +120,7 @@ def infer(
         nfe_step=nfe_step,
         speed=speed,
         cfg_strength=2.0,
-        # fix_duration=segment_duration,
+        fix_duration=segment_duration,
     )
 
     # Remove silence
@@ -261,7 +263,7 @@ def calculate_dynamic_speed(source_segment, reference_audio_path, reference_text
         try:
             # Load a small portion of the reference audio
             ref_y, ref_sr = librosa.load(
-                reference_audio_path, sr=None, duration=10)
+                reference_audio_path, sr=None)
             ref_duration = len(ref_y) / ref_sr
 
             # Get word count from reference text
@@ -281,10 +283,9 @@ def calculate_dynamic_speed(source_segment, reference_audio_path, reference_text
 
     # 3. Calculate ratio (how much faster/slower source is compared to reference)
     speed_ratio = source_speaking_rate / calculate_dynamic_speed.ref_speaking_rate
-
+    print(f"Speed Ratio before squeeze: {speed_ratio:.2f}")
     # 4. Apply limits to avoid extreme values
-    speed_parameter = min(max(speed_ratio, 0.8), 1.8)  # Keep between 0.8-1.8
-
+    speed_parameter = min(max(speed_ratio, 0.8), 5)  # Keep between 0.8-1.8
     print(f"Source rate: {source_speaking_rate:.2f} words/sec, "
           f"Speed parameter: {speed_parameter:.2f}")
 
@@ -292,126 +293,144 @@ def calculate_dynamic_speed(source_segment, reference_audio_path, reference_text
 
 
 def sync_with_timestamps(src_audio_path, tgt_audio_path, tgt_text, output_path, transcription):
-    """
-    Synchronize generated audio with original using Whisper timestamps.
-    """
-    try:
-        print("Preprocessing audio text...")
-        ref_audio, ref_text = utils_infer.preprocess_ref_audio_text(
-            tgt_audio_path, tgt_text, clip_short=False)
-        print(ref_text)
-        print("Performing timestamp-based synchronization...")
+    # Load source and reference info first
+    src_y, src_sr = librosa.load(src_audio_path, sr=24000)
+    src_duration = len(src_y) / src_sr
 
-        # Get source audio duration and sample rate
-        src_y, src_sr = librosa.load(src_audio_path, sr=None)
-        src_duration = librosa.get_duration(y=src_y, sr=src_sr)
+    # Process reference audio once
+    ref_audio, ref_text = utils_infer.preprocess_ref_audio_text(
+        tgt_audio_path, tgt_text, clip_short=False)
+
+    # Check if ref_audio is a string (file path) and load it if needed
+    if isinstance(ref_audio, str):
+        # ref_audio is a file path, need to load it
+        ref_audio, _ = librosa.load(ref_audio, sr=24000)
+
+    # Calculate reference audio duration for passing to F5-TTS
+    ref_audio_samples = len(ref_audio) if isinstance(
+        ref_audio, np.ndarray) else ref_audio.shape[-1]
+    ref_audio_duration = ref_audio_samples / 24000  # Standard F5-TTS sample rate
+    print(f"Reference audio duration: {ref_audio_duration:.2f}s")
+
+    # Get all segments
+    segments = []
+    for segment in transcription["segments"]:
+        segments.append({
+            "text": segment["text"],
+            "start": segment["start"],
+            "end": segment["end"],
+            "duration": segment["end"] - segment["start"]
+        })
+
+    # Calculate total original segment duration
+    total_original_segment_duration = sum(s["duration"] for s in segments)
+
+    # Calculate dynamic expansion budget
+    # This is the critical factor that prevents overall drift
+    expansion_budget = src_duration / total_original_segment_duration
+    # Cap at 1.5x to avoid extreme expansion
+    expansion_budget = min(expansion_budget, 1.5)
+    print(f"Global expansion budget: {expansion_budget:.2f}x")
+
+    # Create output buffer matching source duration exactly
+    final_audio = np.zeros(int(src_duration * src_sr))
+
+    # Track the end of previous segment for overlap detection
+    previous_segment_end = 0
+
+    # Process each segment
+    for i, segment in enumerate(segments):
+        # Calculate timing parameters
+        segment_duration = segment["duration"]
+        word_count = len(segment["text"].split())
+        word_density = word_count / segment_duration
+
+        # Calculate speed parameter
+        speed = calculate_dynamic_speed(segment, tgt_audio_path, ref_text)
+
+        # Calculate quality-preserving multiplier based on speech characteristics
+        if word_density > 5.0 or speed > 2.5:
+            # Fast/dense speech needs more expansion
+            quality_multiplier = 1.4
+        elif word_density > 3.5 or speed > 1.8:
+            # Moderately fast speech
+            quality_multiplier = 1.2
+        else:
+            # Normal speech
+            quality_multiplier = 1.1
+
+        # Apply global budget constraint
+        # This ensures we don't expand beyond what would fit in the source duration
+        final_multiplier = min(quality_multiplier, expansion_budget)
+
+        # Calculate adjusted segment duration
+        adjusted_segment_duration = segment_duration * final_multiplier
+
+        # CRITICAL: Include reference audio duration for F5-TTS
+        # But we'll only use the actual segment portion in final output
+        total_duration_for_f5tts = ref_audio_duration + adjusted_segment_duration
+
         print(
-            f"Source Duration: {src_duration} \nSource Sample Rate: {src_sr}")
-        # Transcribe with word-level timestamps
-        # transcription = whisper_model.transcribe(
-        #     src_audio_path,
-        #     word_timestamps=True,
-        #     language="en"  # Set to appropriate language if known
-        # )
-
-        # Create segments from the timestamps
-        segments = []
-        for segment in transcription["segments"]:
-            segments.append({
-                "text": segment["text"],
-                "start": segment["start"],
-                "end": segment["end"]
-            })
-
+            f"Segment {i+1}/{len(segments)}: Original={segment_duration:.2f}s, Adjusted={adjusted_segment_duration:.2f}s (x{final_multiplier:.2f})")
         print(
-            f"Found {len(segments)} segments in source audio")
+            f"Total duration for F5-TTS: {total_duration_for_f5tts:.2f}s (including {ref_audio_duration:.2f}s reference audio)")
 
-        # Create an empty array for the final audio (filled with silence)
-        # Use a bit longer duration to ensure we don't cut anything off
-        # You changed this from 1.1 don't forget
-        final_audio_length = int(src_duration * src_sr * 1.1)
-        final_audio = np.zeros(final_audio_length)
-        current_position = 0
-        # Process each segment
-        for i, segment in enumerate(segments):
+        # Generate the audio with F5-TTS
+        segment_result = infer(
+            tgt_audio_path,
+            ref_text,
+            segment["text"],
+            total_duration_for_f5tts,  # Pass total duration INCLUDING reference audio
+            F5TTS_ema_model,
+            remove_silence=False,
+            speed=speed
+        )
+
+        # F5-TTS already removes the reference audio portion, so we have just our segment
+        segment_audio = segment_result[1]
+        segment_sr = segment_result[0]
+
+        # Calculate timestamp-based position
+        start_idx = int(segment["start"] * src_sr)
+
+        # Check for potential overlap with previous segment
+        if start_idx < previous_segment_end:
+            # Add a small gap and place after previous segment
+            start_idx = previous_segment_end + int(0.05 * src_sr)
+            print(f"Repositioned segment due to overlap: {start_idx}")
+
+            # If we're running out of space, we need to fit the remaining segments
+            remaining_segments = len(segments) - i
+            if remaining_segments > 1:
+                # Are we past 80% of the source duration?
+                if start_idx > 0.8 * len(final_audio):
+                    # Time-stretch this segment to be shorter
+                    compression_factor = min(
+                        0.9, (len(final_audio) - start_idx) / (1.2 * len(segment_audio)))
+                    segment_audio = pyrb.time_stretch(
+                        segment_audio, segment_sr, 1/compression_factor)
+                    print(
+                        f"Compressed segment by {compression_factor:.2f}x to fit within source duration")
+
+        # Insert the segment at the calculated position
+        available_length = min(
+            len(segment_audio), len(final_audio) - start_idx)
+        final_audio[start_idx:start_idx +
+                    available_length] = segment_audio[:available_length]
+
+        # Track where this segment ends
+        previous_segment_end = start_idx + available_length
+
+        # Stop if we've reached the end of the source duration
+        if previous_segment_end >= len(final_audio) - int(0.1 * src_sr):
             print(
-                f"Processing segment {i+1}/{len(segments)}: {segment['text'][:30]}...")
+                f"Reached end of output buffer at segment {i+1}/{len(segments)}")
+            break
 
-            start = segment['start']
-            end = segment['end']
-
-            segment_duration = end - start
-            print(f"Segment Duration: {segment_duration}")
-            # Generate audio for this segment's text
-            segment_text = segment["text"]
-            if not segment_text:
-                continue
-            speed = calculate_dynamic_speed(
-                segment, tgt_audio_path, ref_text)
-            print(f"Calculated speed adjustment: {speed}")
-            # Create a temporary file for this segment
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_segment:
-                segment_output = tmp_segment.name
-
-            # Generate the voice for just this segment's text
-            segment_result = infer(
-                ref_audio,
-                ref_text,
-                segment_text,
-                segment_duration,
-                F5TTS_ema_model,
-                remove_silence=False,
-                cross_fade_duration=0.15,
-                speed=speed  # Use natural speed, we'll place it precisely
-            )
-
-            # Load the generated segment
-            segment_sr, segment_audio = segment_result[0], segment_result[1]
-            # Check if we need to resample
-            if segment_sr != src_sr:
-                print(f"Resampling after inference")
-                segment_audio = librosa.resample(
-                    segment_audio, orig_sr=segment_sr, target_sr=src_sr)
-
-            sf.write(f"{output_path}-{i+1}-test.wav", segment_audio, src_sr)
-            # Calculate insertion positions
-            start_idx = int(segment["start"] * src_sr)
-            print(f"Insert Position start_idx: {start_idx}")
-            # Choose the shorter of: the segment duration or the available space
-            available_length = min(
-                len(segment_audio),
-                len(final_audio) - start_idx
-            )
-            # available_length = min(len(segment_audio), len(
-            #     final_audio) - current_position)
-            print(f"Segement Audio Length: {len(segment_audio)}")
-            print(f"Final Audio Length: {len(final_audio) - start_idx}")
-            print(f"Available Length: {available_length}")
-            # Insert the segment at the right position
-            final_audio[start_idx:start_idx +
-                        available_length] = segment_audio[:available_length]
-            # print(
-            # f"Inserting into final_audio after position: {current_position}")
-            print(f"Inserting this much of sample: {available_length}")
-            # final_audio[current_position:current_position +
-            #             available_length] = segment_audio[:available_length]
-            # current_position += available_length
-            # Clean up temp file
-            if os.path.exists(segment_output):
-                os.remove(segment_output)
-
-        # Normalize audio
-        final_audio = final_audio / np.max(np.abs(final_audio)) * 0.9
-        # Save the final synchronized audio
-        sf.write(output_path, final_audio, src_sr)
-
-        print(f"✅ Synchronized audio saved to: {output_path}")
-        return output_path
-
-    except Exception as e:
-        print(f"❌ Error in timestamp synchronization: {e}")
-        traceback.print_exc()
-        return None
+    # Save final audio
+    sf.write(output_path, final_audio, src_sr)
+    print(f"✅ Synchronized audio saved to: {output_path}")
+    return output_path
 
 
 @app.route("/inference", methods=["POST"])
