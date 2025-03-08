@@ -351,13 +351,13 @@ def sync_with_timestamps(src_audio_path, tgt_audio_path, tgt_text, output_path, 
         # Calculate quality-preserving multiplier based on speech characteristics
         if word_density > 5.0 or speed > 2.5:
             # Fast/dense speech needs more expansion
-            quality_multiplier = 1.4
+            quality_multiplier = 1.3
         elif word_density > 3.5 or speed > 1.8:
             # Moderately fast speech
-            quality_multiplier = 1.2
+            quality_multiplier = 1.1
         else:
             # Normal speech
-            quality_multiplier = 1.1
+            quality_multiplier = 1
 
         # Apply global budget constraint
         # This ensures we don't expand beyond what would fit in the source duration
