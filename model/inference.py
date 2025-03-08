@@ -1,26 +1,36 @@
-import json
-import os
-import time
-import numpy as np
-import traceback
-import torch
-import soundfile as sf
-import librosa
-from flask import Flask, request, jsonify
+from f5_tts.model.utils import convert_char_to_pinyin, get_tokenizer
+from f5_tts.model import CFM, DiT, UNetT
+from f5_tts.infer.utils_infer import load_checkpoint, load_vocoder, save_spectrogram, load_model, remove_silence_for_generated_wav, infer_process
+import f5_tts.infer.utils_infer as utils_infer
+import torchaudio
+import torch.nn.functional as F
+from scipy import signal
+import whisper
+import pyworld as pw
 from scipy.io.wavfile import write
+from flask import Flask, request, jsonify
+import librosa
+import soundfile as sf
+import torch
+import traceback
+import numpy as np
+import time
+import json
+import tempfile
+from cached_path import cached_path
+import os
+# Enable MPS fallback to CPU for operations not supported by MPS
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
-# Import FreeVC components
-import sys
-sys.path.append('./FreeVC')  # Add FreeVC directory to path
-from FreeVC.wavlm import WavLM, WavLMConfig  # NOQA
-from utils import get_hparams_from_file, load_checkpoint, get_vocoder, get_cmodel, get_content, get_vocoder, transform, load_checkpoint, load_wav_to_torch  # NOQA
-from FreeVC.text import text_to_sequence  # NOQA
-from FreeVC.models import SynthesizerTrn  # NOQA
-from FreeVC.hifigan.models import Generator  # NOQA
-from FreeVC.hifigan import AttrDict  # NOQA
-from FreeVC.pitch import FreeVCPitchExtractor  # NOQA
-from FreeVC.speaker_encoder.voice_encoder import SpeakerEncoder  # NOQA
-from FreeVC.mel_processing import mel_spectrogram_torch  # NOQA
+try:
+    import spaces
+
+    USING_SPACES = True
+except ImportError:
+    USING_SPACES = False
+
+# F5-TTS components
+
 app = Flask(__name__)
 # Get the absolute path to the `upload` folder
 UPLOAD_FOLDER = os.path.abspath(os.path.join(
@@ -33,320 +43,375 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs("./model_cache", exist_ok=True)
 
 # Global variables for models
-net_g = None
-content_model = None
-vocoder = None
-pitch_extractor = None
-cmodel = None
-smodel = None
-hps = None
-speaker_embeddings = {}
+whisper_model = None  # Whisper model
+whisper_device = "cpu"  # Device for Whisper - always CPU to avoid sparse tensor issues
+
+# F5-TTS model components
+f5_model = None
+f5_vocoder = None
+f5_tokenizer = None
+
+# Memory optimization settings
+MAX_AUDIO_LENGTH = 10  # Maximum audio length in seconds to process at once
+CHUNK_SIZE = 200  # Maximum number of words to process at once
+
+DEFAULT_TTS_MODEL = "F5-TTS"
+tts_model_choice = DEFAULT_TTS_MODEL
+
+DEFAULT_TTS_MODEL_CFG = [
+    "hf://SWivid/F5-TTS/F5TTS_Base/model_1200000.safetensors",
+    "hf://SWivid/F5-TTS/F5TTS_Base/vocab.txt",
+    json.dumps(dict(dim=1024, depth=22, heads=16,
+                    ff_mult=2, text_dim=512, conv_layers=4)),
+]
+
+
+def load_f5tts(ckpt_path=str(cached_path("hf://SWivid/F5-TTS/F5TTS_Base/model_1200000.safetensors"))):
+    F5TTS_model_cfg = dict(dim=1024, depth=22, heads=16,
+                           ff_mult=2, text_dim=512, conv_layers=4)
+    return load_model(DiT, F5TTS_model_cfg, ckpt_path)
+
 
 try:
-    # Initialize FreeVC model
-    print("Loading FreeVC model...")
-    ptfile = "./FreeVC/pretrained_models/freevc.pth"
-    # Load config (adjust paths as needed)
-    hps = get_hparams_from_file('./FreeVC/configs/freevc.json')
-
-    # Initialize the model
-    net_g = SynthesizerTrn(
-        hps.data.filter_length // 2 + 1,
-        hps.train.segment_size // hps.data.hop_length,
-        **hps.model).to('cpu')
-
-    # Load the pretrained model
-    _ = net_g.eval()
-    _ = load_checkpoint(ptfile, net_g, None, True)
-
-    print("✅ FreeVC model loaded successfully")
-    # Load WavLM model for content extraction
-    print("Loading WavLM model...")
-    cmodel = get_cmodel(0)
-
-    # if torch.backends.mps.is_available():
-    #     device = torch.device("mps")
-    #     print("Using MPS (Apple Metal) acceleration")
-    # elif torch.cuda.is_available():
-    #     device = torch.device("cuda")
-    #     print("Using CUDA acceleration")
-    # else:
-    #     device = torch.device("cpu")
-    #     print("Using CPU only")
-    # device = torch.device("cpu")
-    # content_model = get_content_model(device)
-    print("✅ WavLM model loaded successfully")
-    if hps.model.use_spk:
-        print("Loading speaker encoder...")
-        encoder_dir = os.path.abspath(os.path.join(
-            os.path.dirname(__file__), "FreeVC", "speaker_encoder", "ckpt"))
-        print(f"encoder dir: {encoder_dir}")
-        encoder_model = os.path.join(
-            encoder_dir, "pretrained_bak_5805000.pt")
-        print(f"encoder model: {encoder_model}")
-        smodel = SpeakerEncoder(encoder_model)
-    # Initialize the pitch extractor
-    # print("Loading pitch extractor...")
-    # try:
-    # 	pitch_extractor = FreeVCPitchExtractor(
-    # 		hop_length=hps.data.hop_length).to(device)
-    # 	print("✅ Pitch extractor loaded successfully")
-    # except Exception as e:
-    # 	print(f"⚠️ Could not load pitch extractor: {e}")
-    # 	pitch_extractor = None
-
-    # Load HiFiGAN vocoder for higher quality synthesis
-    # print("Loading HiFiGAN vocoder...")
-    # try:
-    # 	# Try to load the vocoder
-    # 	with open("./FreeVC/hifigan/config_v3.json", "r") as f:
-    # 		config = json.load(f)
-    # 	config = AttrDict(config)
-    # 	vocoder = Generator(config)
-    # 	ckpt = torch.load("./FreeVC/hifigan/generator_v3", map_location=device)
-    # 	vocoder.load_state_dict(ckpt["generator"])
-    # 	vocoder.eval()
-    # 	vocoder.remove_weight_norm()
-    # 	vocoder = vocoder.to(device)
-    # 	print("✅ HiFiGAN v3 vocoder loaded successfully")
-    # except Exception as e:
-    # 	print(f"Warning: Could not load HiFiGAN v3, trying v1: {e}")
-    # 	try:
-    # 		# Fallback to v1 if available
-    # 		with open("./FreeVC/hifigan/config.json", "r") as f:
-    # 			config = json.load(f)
-    # 		config = AttrDict(config)
-    # 		vocoder = Generator(config)
-    # 		ckpt = torch.load("./FreeVC/hifigan/generator_v1",
-    # 						  map_location=device)
-    # 		vocoder.load_state_dict(ckpt["generator"])
-    # 		vocoder.eval()
-    # 		vocoder.remove_weight_norm()
-    # 		vocoder = vocoder.to(device)
-    # 		print("✅ HiFiGAN v1 vocoder loaded successfully")
-    # 	except Exception as e2:
-    # 		print(f"Warning: Could not load HiFiGAN vocoder: {e2}")
-    # 		vocoder = None
-    # 		print("⚠️ Continuing without HiFiGAN vocoder - audio quality may be reduced")
-
-    # Load speaker embeddings from a predefined set
-    # For simplicity, we'll create a mapping of voice types
-    speaker_embeddings = {
-        "kid": torch.load('./FreeVC/speaker_embeddings/kid.pt'),
-        # "kid2": torch.load('./FreeVC/speaker_embeddings/kid2.pt'),
-        "obama": torch.load('./FreeVC/speaker_embeddings/obama.pt'),
-        # "male": torch.load('./FreeVC/speaker_embeddings/male.pt')
-    }
-
-    # Print the dimensions of loaded embeddings
-    for speaker_type, embedding in speaker_embeddings.items():
-        print(f"Loaded {speaker_type} embedding with shape: {embedding.shape}")
-
-    print("✅ Speaker embeddings loaded successfully")
-
-    # Check if the model is speaker-aware
-    if not hasattr(hps.model, 'use_spk') or not hps.model.use_spk:
-        print("⚠️ Model doesn't appear to support speaker conditioning!")
-
-    # Add this code to see if the embeddings are meaningfully different
-    for name1, emb1 in speaker_embeddings.items():
-        for name2, emb2 in speaker_embeddings.items():
-            if name1 != name2:
-                similarity = torch.nn.functional.cosine_similarity(
-                    emb1.flatten(), emb2.flatten(), dim=0)
-                print(
-                    f"Similarity between {name1} and {name2}: {similarity.item()}")
-
+    whisper_device = "cpu"
+    print(f"Using {whisper_device} specifically for Whisper model")
+    # Using base model for faster loading, use "medium" or "large" for better accuracy
+    whisper_model = whisper.load_model("turbo", device=whisper_device)
+    print("✅ Whisper model loaded successfully")
+    vocoder = load_vocoder()
+    print("✅ Vocoder model loaded successfully")
+    F5TTS_ema_model = load_f5tts()
+    print("✅ F5_TTS model loaded successfully")
 except Exception as e:
-    print(f"Error loading model: {e}")
-    traceback.print_exc()
-    net_g = None
-    content_model = None
-    vocoder = None
-    cmodel = None
-    smodel = None
+    print(f"❌ sumthin broke: {e}")
 
 
-def get_speaker_embedding(speaker_type):
-    """Get speaker embedding based on desired voice type."""
-    # Return the pre-loaded speaker embedding
-    if speaker_type in speaker_embeddings:
-        return speaker_embeddings[speaker_type]
-    else:
-        print(f"Speaker type {speaker_type} not found, falling back to 'kid'")
-        return speaker_embeddings["kid"]
+def infer(
+        ref_audio,
+        ref_text,
+        gen_text,
+        segment_duration,
+        model,
+        remove_silence,
+        cross_fade_duration=0.15,
+        nfe_step=32,
+        speed=1,
+):
+    if not ref_audio:
+        print("Please provide reference audio.")
+        return
+
+    if not gen_text.strip():
+        print("Please enter text to generate.")
+        return
+
+    ema_model = F5TTS_ema_model
+    duration = librosa.get_duration(path=ref_audio)
+    print(f"Ref Audio Duration: {duration:.2f} seconds")
+    final_wave, final_sample_rate, combined_spectrogram = infer_process(
+        ref_audio,
+        ref_text,
+        gen_text,
+        ema_model,
+        vocoder,
+        cross_fade_duration=cross_fade_duration,
+        nfe_step=nfe_step,
+        speed=speed,
+        cfg_strength=2.0,
+        # fix_duration=segment_duration,
+    )
+
+    # Remove silence
+    if remove_silence:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
+            sf.write(f.name, final_wave, final_sample_rate)
+            remove_silence_for_generated_wav(f.name)
+            final_wave, _ = torchaudio.load(f.name)
+        final_wave = final_wave.squeeze().cpu().numpy()
+
+    # Save the spectrogram
+    # with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_spectrogram:
+    # 	spectrogram_path = tmp_spectrogram.name
+    # 	save_spectrogram(combined_spectrogram, spectrogram_path)
+
+    return (final_sample_rate, final_wave)
 
 
-def change_voice(audio_path, output_path, speaker_embedding, strength):
+def show_info(msg):
+    print(msg)
+
+
+utils_infer.show_info = show_info
+
+
+def rip(src_audio_path, tgt_audio_path, output_path):
     try:
-        print(f"🔹 Starting voice conversion for: {audio_path}")
-        start_time = time.time()
+        # Get source audio duration
+        src_duration = 0
+        try:
+            src_duration = librosa.get_duration(path=src_audio_path)
+            print(f"Source audio duration: {src_duration:.2f} seconds")
+        except Exception as dur_error:
+            print(f"Error getting source duration: {dur_error}")
+            # Continue anyway, just won't do time stretching
+        global whisper_device
+        decode_options = {
+            "fp16": False,
+        }
+        # Transcribe with timestamps enabled
+        transcription_result = whisper_model.transcribe(
+            src_audio_path,
+            **decode_options
+        )
+        try:
+            # Create a serializable version with only what you need
+            serializable_data = {
+                "text": transcription_result["text"],
+                "language": transcription_result["language"],
+                "segments": []
+            }
 
-        if not os.path.exists(audio_path):
-            raise FileNotFoundError(f"🚨 Audio file not found: {audio_path}")
+            # Process segments to ensure all values are serializable
+            for segment in transcription_result["segments"]:
+                clean_segment = {
+                    "id": segment["id"],
+                    "start": segment["start"],
+                    "end": segment["end"],
+                    "text": segment["text"]
+                }
 
-        # Load input audio
-        source_audio, sr = librosa.load(audio_path, sr=16000, mono=True)
+                # Add words if they exist
+                if "words" in segment:
+                    clean_segment["words"] = [
+                        {
+                            "word": word["word"],
+                            "start": word["start"],
+                            "end": word["end"]
+                        }
+                        for word in segment["words"]
+                    ]
 
-        # Convert to tensor and move to CUDA if available
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        source = torch.FloatTensor(source_audio).unsqueeze(
-            0).unsqueeze(0).to(device)
+                serializable_data["segments"].append(clean_segment)
 
-        with torch.no_grad():
-            # Extract content features using WavLM
-            # c = extract_content(content_model, source)
-            c = utils.get_cmodel(0)
-            # Extract pitch information if available - for logging/analysis only
-            # Note: FreeVC doesn't directly use these pitch values in inference,
-            # but we extract them for debugging and potential future features
-            if pitch_extractor is not None:
-                print("Extracting pitch information for analysis...")
-                try:
-                    # Extract f0 (fundamental frequency) and uv (voiced/unvoiced)
-                    f0, uv = pitch_extractor(source.squeeze(1))
-                    print(f"Pitch extraction successful. Shape: {f0.shape}")
-                    # We won't pass these to the model - pitch is encoded in content features
-                except Exception as pitch_error:
-                    print(f"Error in pitch extraction: {pitch_error}")
-                    f0, uv = None, None
-            else:
-                f0, uv = None, None
+            # Write to file with proper JSON formatting
+            # with open(transcription_path, 'w', encoding='utf-8') as f:
+            #     f.write(json.dumps(serializable_data, indent=2))
 
-            # Use the provided target speaker embedding and adapt it
-            tgt_embedding = speaker_embedding.to(device)
+            # print(f"Transcription saved to {transcription_path}")
+        except Exception as e:
+            print(f"Error saving transcription: {e}")
+            # Continue with processing even if saving fails
 
-            # Adapt the embedding to match the expected dimensions (256 channels)
-            # tgt_embedding = adapt_speaker_embedding(
-            #     tgt_embedding, target_dim=256)
+        print(serializable_data)
+        # Still get target audio transcription for reference
+        tgt_transcription = whisper_model.transcribe(
+            tgt_audio_path, **decode_options)
 
-            # Properly normalize the embedding to unit length (better than just multiplying)
-            # This preserves the direction of the embedding vector while controlling magnitude
-            # norm = torch.norm(tgt_embedding, p=2, dim=1, keepdim=True)
-            # tgt_embedding = tgt_embedding / (norm + 1e-8) * strength
+        text = transcription_result["text"]
+        tgt_text = tgt_transcription["text"]
+        language = transcription_result["language"]
 
-            tgt_embedding * strength
-            print(f"Applied strength {strength} with proper normalization")
-            print(f"Shape after processing: {tgt_embedding.shape}")
+        # final_sample_rate, final_wave = infer(
+        #     tgt_audio_path, tgt_text, text, F5TTS_ema_model, remove_silence=False)
+        # Use the timestamp-based synchronization
+        sync_output_path = sync_with_timestamps(
+            src_audio_path,
+            tgt_audio_path,
+            tgt_text,
+            output_path,
+            serializable_data  # Pass the full transcription with timestamps
+        )
 
-            # Get global hps variable
-            global hps
+        # if isinstance(final_wave, np.ndarray):
+        #     # If it's a numpy array, convert to tensor first
+        #     final_wave = torch.from_numpy(final_wave)
+        # # Add channel dimension if it's 1D
+        # if final_wave.dim() == 1:
+        #     # Add channel dimension [1, samples]
+        #     final_wave = final_wave.unsqueeze(0)
 
-            # Perform voice conversion using the infer method
-            if hasattr(hps.model, 'use_spk') and hps.model.use_spk:
-                # NOTE: FreeVC's SynthesizerTrn.infer() method doesn't accept f0 and uv parameters
-                # The pitch information is already captured in the content features (c)
-                print("Using standard inference without explicit pitch")
-                mel = freevc_model.infer(c, g=tgt_embedding)
-            else:
-                # Fallback case for models that need mel for speaker encoding
-                mel = freevc_model.infer(c, g=tgt_embedding, mel=source)
-
-            # After inference
-            print(f"Model output shape: {mel.shape}")
-
-            # ========== SIMPLIFIED APPROACH ==========
-            # Use direct output from FreeVC model without HiFiGAN
-            # if len(mel.shape) >= 3:
-            #     # If output is [batch, channel, time] or [batch, 1, channel, time]
-            #     waveform_np = mel.squeeze().cpu().numpy()
-            # else:
-            #     # Handle unexpected shapes
-            #     waveform_np = mel.cpu().numpy()
-
-            # print(f"Using direct model output. Shape: {waveform_np.shape}")
-
-        # Simple normalization without aggressive processing
-        # waveform_np = waveform_np / (np.max(np.abs(waveform_np)) + 1e-6) * 0.9
-
-        # Save as mono audio, ensuring we have a 1D array
-        # if len(waveform_np.shape) > 1:
-            # waveform_np = waveform_np.squeeze()
-
-        # Final check to ensure we have a valid 1D waveform
-        # if len(waveform_np.shape) > 1:
-        #     print(
-        #         f"WARNING: Unexpected audio shape: {waveform_np.shape}. Attempting to fix.")
-        #     if waveform_np.shape[0] == 1:
-        #         waveform_np = waveform_np[0]
-        #     else:
-        #         # Average across all dimensions
-        #         waveform_np = waveform_np.mean(axis=0)
-
-        sf.write(output_path, mel, 16000, subtype="PCM_16")
-
-        end_time = time.time()
-        print(
-            f"🎉 Voice conversion completed in {end_time - start_time:.2f} seconds.")
-        return {"success": True, "output_audio": output_path}
+        return {
+            "success": True,
+            "output_path": output_path,
+            "text": text,
+            "language": language,
+            "transcript": serializable_data
+        }
     except Exception as e:
         print(f"❌ Error in voice conversion: {e}")
         traceback.print_exc()
         return {"success": False, "error": str(e)}
 
 
-def change_voice_real(src_audio_path, tgt_audio_path, output_path, strength):
-    print(f"🔹 Starting voice conversion for: {src_audio_path}")
-    start_time = time.time()
+def calculate_dynamic_speed(source_segment, reference_audio_path, reference_text):
+    """
+    Calculate the ideal speed parameter by comparing speaking rates.
+
+    Returns: float - speed parameter for F5-TTS
+    """
+    # 1. Calculate source speaking rate
+    source_text = source_segment["text"]
+    source_duration = source_segment["end"] - source_segment["start"]
+    source_word_count = len(source_text.split())
+    source_speaking_rate = source_word_count / source_duration  # words per second
+
+    # 2. Calculate reference speaking rate from a small sample
+    if not hasattr(calculate_dynamic_speed, "ref_speaking_rate"):
+        # Only calculate this once and cache it
+        try:
+            # Load a small portion of the reference audio
+            ref_y, ref_sr = librosa.load(
+                reference_audio_path, sr=None, duration=10)
+            ref_duration = len(ref_y) / ref_sr
+
+            # Get word count from reference text
+            ref_word_count = len(reference_text.split())
+
+            # Calculate speaking rate
+            ref_speaking_rate = ref_word_count / ref_duration
+
+            # Cache for future calls
+            calculate_dynamic_speed.ref_speaking_rate = ref_speaking_rate
+            print(
+                f"Reference speaking rate: {ref_speaking_rate:.2f} words/sec")
+        except Exception as e:
+            print(f"Error calculating reference rate: {e}")
+            # Default fallback
+            calculate_dynamic_speed.ref_speaking_rate = 2.5  # typical speaking rate
+
+    # 3. Calculate ratio (how much faster/slower source is compared to reference)
+    speed_ratio = source_speaking_rate / calculate_dynamic_speed.ref_speaking_rate
+
+    # 4. Apply limits to avoid extreme values
+    speed_parameter = min(max(speed_ratio, 0.8), 1.8)  # Keep between 0.8-1.8
+
+    print(f"Source rate: {source_speaking_rate:.2f} words/sec, "
+          f"Speed parameter: {speed_parameter:.2f}")
+
+    return speed_parameter
+
+
+def sync_with_timestamps(src_audio_path, tgt_audio_path, tgt_text, output_path, transcription):
+    """
+    Synchronize generated audio with original using Whisper timestamps.
+    """
     try:
-        if not os.path.exists(src_audio_path):
-            raise FileNotFoundError(f"🚨 Audio file not found: {audio_path}")
+        print("Preprocessing audio text...")
+        ref_audio, ref_text = utils_infer.preprocess_ref_audio_text(
+            tgt_audio_path, tgt_text, clip_short=False)
+        print(ref_text)
+        print("Performing timestamp-based synchronization...")
 
-        print(f"🔊 Processing target audio.")
-        wav_tgt, _ = librosa.load(tgt_audio_path, sr=hps.data.sampling_rate)
-        wav_tgt, _ = librosa.effects.trim(wav_tgt, top_db=20)
+        # Get source audio duration and sample rate
+        src_y, src_sr = librosa.load(src_audio_path, sr=None)
+        src_duration = librosa.get_duration(y=src_y, sr=src_sr)
+        print(
+            f"Source Duration: {src_duration} \nSource Sample Rate: {src_sr}")
+        # Transcribe with word-level timestamps
+        # transcription = whisper_model.transcribe(
+        #     src_audio_path,
+        #     word_timestamps=True,
+        #     language="en"  # Set to appropriate language if known
+        # )
 
-        if hps.model.use_spk:
-            print(f"Use SPK")
-            g_tgt = smodel.embed_utterance(wav_tgt) * strength
-            print(f"Applied strength {strength} with proper normalization")
-            g_tgt = torch.from_numpy(g_tgt).unsqueeze(0).to('cpu')
-        else:
-            print(f"Fallback, numpy spectrogram")
-            wav_tgt = torch.from_numpy(wav_tgt).unsqueeze(0).to('cpu')
-            mel_tgt = mel_spectrogram_torch(
-                wav_tgt,
-                hps.data.filter_length,
-                hps.data.n_mel_channels,
-                hps.data.sampling_rate,
-                hps.data.hop_length,
-                hps.data.win_length,
-                hps.data.mel_fmin,
-                hps.data.mel_fmax
+        # Create segments from the timestamps
+        segments = []
+        for segment in transcription["segments"]:
+            segments.append({
+                "text": segment["text"],
+                "start": segment["start"],
+                "end": segment["end"]
+            })
+
+        print(
+            f"Found {len(segments)} segments in source audio")
+
+        # Create an empty array for the final audio (filled with silence)
+        # Use a bit longer duration to ensure we don't cut anything off
+        # You changed this from 1.1 don't forget
+        final_audio_length = int(src_duration * src_sr * 1.1)
+        final_audio = np.zeros(final_audio_length)
+        current_position = 0
+        # Process each segment
+        for i, segment in enumerate(segments):
+            print(
+                f"Processing segment {i+1}/{len(segments)}: {segment['text'][:30]}...")
+
+            start = segment['start']
+            end = segment['end']
+
+            segment_duration = end - start
+            print(f"Segment Duration: {segment_duration}")
+            # Generate audio for this segment's text
+            segment_text = segment["text"]
+            if not segment_text:
+                continue
+            speed = calculate_dynamic_speed(
+                segment, tgt_audio_path, ref_text)
+            print(f"Calculated speed adjustment: {speed}")
+            # Create a temporary file for this segment
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_segment:
+                segment_output = tmp_segment.name
+
+            # Generate the voice for just this segment's text
+            segment_result = infer(
+                ref_audio,
+                ref_text,
+                segment_text,
+                segment_duration,
+                F5TTS_ema_model,
+                remove_silence=False,
+                cross_fade_duration=0.15,
+                speed=speed  # Use natural speed, we'll place it precisely
             )
 
-        # process src
-        print(f"🔊 Processing source audio.")
-        wav_src, _ = librosa.load(src_audio_path, sr=hps.data.sampling_rate)
-        wav_src = torch.from_numpy(wav_src).unsqueeze(0).to('cpu')
-        c = get_content(cmodel, wav_src)
+            # Load the generated segment
+            segment_sr, segment_audio = segment_result[0], segment_result[1]
+            # Check if we need to resample
+            if segment_sr != src_sr:
+                print(f"Resampling after inference")
+                segment_audio = librosa.resample(
+                    segment_audio, orig_sr=segment_sr, target_sr=src_sr)
 
-        if hps.model.use_spk:
-            print("🤖 Using spk inference.")
-            audio = net_g.infer(c, g=g_tgt)
-        else:
-            print("🤖 Using fallback inference")
-            audio = net_g.infer(c, mel=mel_tgt)
-        audio = audio[0][0].data.cpu().float().numpy()
+            sf.write(f"{output_path}-{i+1}-test.wav", segment_audio, src_sr)
+            # Calculate insertion positions
+            start_idx = int(segment["start"] * src_sr)
+            print(f"Insert Position start_idx: {start_idx}")
+            # Choose the shorter of: the segment duration or the available space
+            available_length = min(
+                len(segment_audio),
+                len(final_audio) - start_idx
+            )
+            # available_length = min(len(segment_audio), len(
+            #     final_audio) - current_position)
+            print(f"Segement Audio Length: {len(segment_audio)}")
+            print(f"Final Audio Length: {len(final_audio) - start_idx}")
+            print(f"Available Length: {available_length}")
+            # Insert the segment at the right position
+            final_audio[start_idx:start_idx +
+                        available_length] = segment_audio[:available_length]
+            # print(
+            # f"Inserting into final_audio after position: {current_position}")
+            print(f"Inserting this much of sample: {available_length}")
+            # final_audio[current_position:current_position +
+            #             available_length] = segment_audio[:available_length]
+            # current_position += available_length
+            # Clean up temp file
+            if os.path.exists(segment_output):
+                os.remove(segment_output)
 
-        write(output_path, hps.data.sampling_rate, audio)
-        end_time = time.time()
-        conversion_time = f"{end_time - start_time:.2f}"
-        print(
-            f"🎉 Voice conversion completed in {conversion_time} seconds.")
-        return {"success": True, "output_path": output_path, "time": conversion_time}
+        # Normalize audio
+        final_audio = final_audio / np.max(np.abs(final_audio)) * 0.9
+        # Save the final synchronized audio
+        sf.write(output_path, final_audio, src_sr)
+
+        print(f"✅ Synchronized audio saved to: {output_path}")
+        return output_path
+
     except Exception as e:
-        print(f"❌ Error in voice conversion: {e}")
+        print(f"❌ Error in timestamp synchronization: {e}")
         traceback.print_exc()
-        return {"success": False, "error": str(e)}
-
-
-def extract_speaker_embedding(audio):
-    """Extract speaker embedding from audio."""
-    # In a full implementation, this would use a speaker encoder
-    # For simplicity, we'll return a placeholder
-    # Adjust size based on FreeVC requirements
-    return torch.zeros(512).unsqueeze(0)
+        return None
 
 
 @app.route("/inference", methods=["POST"])
@@ -354,55 +419,124 @@ def inference():
     try:
         print("📩 Received a new inference request.")
 
-        if net_g is None:
-            print("❌ Model failed to load.")
-            return jsonify({"error": "Model failed to load"}), 500
+        # Check if models are loaded
+        if whisper_model is None:
+            print("❌ Whisper model failed to load.")
+            return jsonify({"error": "Speech recognition model failed to load"}), 500
 
+        # if f5_model is None:
+        #     print("❌ F5-TTS model failed to load.")
+        #     return jsonify({"error": "Voice synthesis model failed to load"}), 500
+
+        # Ensure we have the device variables available in this context
+        global device, whisper_device
+
+        # Get request data
         data = request.json
         src_path = data.get("src_path")
         tgt_path = data.get("tgt_path")
         src_filename = data.get("src_filename")
         tgt_filename = data.get("tgt_filename")
-        # voice_type = data.get("voice_type", "kid")  # Default to kid voice
 
-        # Get strength parameter from request or use default
-        strength = float(data.get("strength", 2.5))  # Increased default to 2.5
+        # Get conversion settings
+        output_format = data.get("output_format", "wav")  # Output audio format
 
-        # print(f"Using voice type: {voice_type} with strength: {strength}")
+        # Additional settings
+        # Whether to match source duration
+        keep_original_timing = data.get("keep_original_timing", False)
 
+        # Validate inputs
         if not src_path:
-            print("❌ No audio file provided in request.")
-            return jsonify({"error": "No audio file provided"}), 400
+            print("❌ No source audio provided in request.")
+            return jsonify({"error": "No source audio provided"}), 400
 
         src_audio_path = os.path.join(UPLOAD_FOLDER, src_filename)
-        print(f"🔍 Checking if file exists: {src_audio_path}")
+        print(f"🔍 Checking if source file exists: {src_audio_path}")
 
         if not src_audio_path or not os.path.exists(src_audio_path):
-            print(f"❌ Audio file not found: {src_audio_path}")
-            return jsonify({"error": "Audio file is missing or invalid"}), 400
+            print(f"❌ Source audio file not found: {src_audio_path}")
+            return jsonify({"error": "Source audio file is missing or invalid"}), 400
 
         tgt_audio_path = os.path.join(UPLOAD_FOLDER, tgt_filename)
-        print(f"🔍 Checking if file exists: {tgt_path}")
+        print(f"🔍 Checking if target file exists: {tgt_audio_path}")
 
         if not tgt_audio_path or not os.path.exists(tgt_audio_path):
-            print(f"❌ Audio file not found: {tgt_audio_path}")
-            return jsonify({"error": "Audio file is missing or invalid"}), 400
-        # Get the appropriate speaker embedding
-        # speaker_embedding = get_speaker_embedding(voice_type)
+            print(f"❌ Target audio file not found: {tgt_audio_path}")
+            return jsonify({"error": "Target audio file is missing or invalid"}), 400
 
-        output_audio_path = os.path.join(
+        # Prepare output paths
+        output_wav_path = os.path.join(
             UPLOAD_FOLDER, f"{src_filename}_converted.wav")
-        print(f"🚀 Starting voice conversion process...{output_audio_path}")
 
-        # result = change_voice(audio_path, output_audio_path,
-        #   speaker_embedding, strength)
+        transcription_path = os.path.join(
+            UPLOAD_FOLDER, f"transcription-{time.time()}.json")
 
-        result = change_voice_real(
-            src_audio_path, tgt_audio_path, output_audio_path, strength)
+        # Final output path might be a different format
+        final_output_path = output_wav_path
+        if output_format != "wav":
+            final_output_path = os.path.join(
+                UPLOAD_FOLDER, f"{src_filename}_converted.{output_format}")
+
+        print(f"🚀 Starting voice conversion process to: {output_wav_path}")
+
+        # Perform voice conversion
+        start_time = time.time()
+
+        # Use F5-TTS for voice cloning via transcription
+        print("Using F5-TTS for voice synthesis")
+        # result = convert_voice(
+        # src_audio_path, tgt_audio_path, output_wav_path, keep_original_timing)
+        result = rip(src_audio_path, tgt_audio_path, output_wav_path)
+        # Convert to requested format if needed
+        if result["success"] and output_format != "wav":
+            try:
+                # print(f"Converting output to {output_format} format...")
+                # import subprocess
+
+                # Use FFmpeg to convert the format
+                # command = [
+                #     "ffmpeg", "-y", "-i", output_wav_path,
+                #     "-c:a", "libmp3lame" if output_format == "mp3" else "copy",
+                #     final_output_path
+                # ]
+                # subprocess.run(command, check=True)
+
+                # Update the output path in the result
+                result["output_path"] = final_output_path
+
+                # Clean up the WAV file if conversion succeeded
+                # if os.path.exists(final_output_path) and os.path.exists(output_wav_path):
+                # 	os.remove(output_wav_path)
+
+            except Exception as format_err:
+                print(f"Error converting format: {format_err}")
+                # Keep the original WAV file if conversion failed
+                pass
+
+        end_time = time.time()
+        conversion_time = f"{end_time - start_time:.2f}"
+        print(f"🎉 Voice conversion completed in {conversion_time} seconds.")
 
         if result["success"]:
             print("✅ Voice conversion successful!")
-            return jsonify({"output_path": result["output_path"], "time": result["time"]})
+
+            # Basic response data
+            response_data = {
+                "output_path": result["output_path"],
+                "time": conversion_time
+            }
+
+            # Add additional data from F5-TTS if available
+            if "text" in result:
+                response_data["text"] = result["text"]
+            if "language" in result:
+                response_data["language"] = result["language"]
+            if "duration" in result:
+                response_data["duration"] = result["duration"]
+            # if "transcript" in result:
+                # with open(transcription_path, 'w'):
+                #     json.dumps(result["transcript"])
+            return jsonify(response_data)
         else:
             print(f"❌ Error: {result['error']}")
             return jsonify({"error": result["error"]}), 500
@@ -410,26 +544,8 @@ def inference():
     except Exception as e:
         print(f"❌ Server error: {e}")
         traceback.print_exc()
-        return jsonify({"error": "Internal server error"}), 500
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
-
-# Memory optimization for MPS (Apple Silicon)
-def optimize_for_mps():
-    """Apply optimizations for MPS device (Apple Silicon)"""
-    if torch.backends.mps.is_available():
-        # Empty the MPS cache to free up memory
-        torch.mps.empty_cache()
-        # Configure tensor allocation to be more efficient
-        # Less aggressive caching
-        os.environ['PYTORCH_MPS_HIGH_WATERMARK_RATIO'] = '0.0'
-        # CRITICAL: Enable CPU fallback for operations not supported by MPS
-        os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
-        print("Applied MPS optimizations for Apple Silicon")
-        print("Enabled CPU fallback for unsupported MPS operations")
-
-
-# Call the optimization function
-# optimize_for_mps()
 
 if __name__ == "__main__":
     app.run(port=8000, debug=True)

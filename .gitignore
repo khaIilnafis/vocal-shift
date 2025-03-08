@@ -39,3 +39,9 @@ model_cache/
 
 model/FreeVC/** 
 model/DiffHierVC/** 
+model/ckpts/** 
+*.wav
+*.txt
+*.vtt
+*.tsv
+*.srt

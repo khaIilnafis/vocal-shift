@@ -125,9 +125,17 @@ export function createController() {
       try {
         // Extract audio from video using ffmpeg
         await execPromise(
-          `ffmpeg -i ${srcPath} -ar 16000 -ac 1 -c:a pcm_s16le ${audioPath}`,
+          `ffmpeg -i ${srcPath} -vn -ac 1 -ar 24000 ${audioPath}`,
           "EXTRACT"
         );
+        // await execPromise(
+        // 	`ffmpeg -i ${srcPath} -q:a 0 -map a ${audioPath}`,
+        // 	"EXTRACT"
+        //   );
+        // await execPromise(
+        //   `ffmpeg -i ${srcPath} -ar 16000 -ac 1 -c:a pcm_s16le ${audioPath}`,
+        //   "EXTRACT"
+        // );
         const payload = JSON.stringify({
           src_path: audioPath,
           src_filename: srcFilename,
@@ -164,7 +172,7 @@ export function createController() {
         }
 
         await execPromise(
-          `ffmpeg -y -i "${srcPath}" -i "${output_path}" -c:v copy -map 0:v:0 -map 1:a:0 "${outputVideoPath}"`,
+          `ffmpeg -y -i "${srcPath}" -i "${output_path}" -c:v copy -c:a aac -b:a 192k -map 0:v:0 -map 1:a:0 "${outputVideoPath}"`,
           "MERGE"
         );
 
@@ -173,11 +181,11 @@ export function createController() {
           video: outputVideoPath,
           time: time,
         });
-        fs.unlink(srcAudioPath, (err) => {});
-        fs.unlink(srcPath, (err) => {});
+        // fs.unlink(srcAudioPath, (err) => {});
+        // fs.unlink(srcPath, (err) => {});
         // fs.unlink(output_path, (err) => {});
-        fs.unlink(tgtPath, (err) => {});
-        fs.unlink(audioPath, (err) => {});
+        // fs.unlink(tgtPath, (err) => {});
+        // fs.unlink(audioPath, (err) => {});
       } catch (error) {
         console.error("Error processing request:", error);
         res.status(500).json({ error: "Voice processing failed" });
